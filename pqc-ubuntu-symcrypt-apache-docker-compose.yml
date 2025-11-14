@@ -1,0 +1,9 @@
+version: "3.9"
+services:
+  pqc-web-app:
+    build: .
+    container_name: pqc-web-app
+    ports:
+      - "8080:80"
+      - "8443:443"
+    restart: unless-stopped
