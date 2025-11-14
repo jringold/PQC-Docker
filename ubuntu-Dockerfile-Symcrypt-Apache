@@ -1,0 +1,45 @@
+FROM ubuntu:22.04
+
+# Install dependencies for SymCrypt and OpenSSL
+RUN apt-get update && apt-get install -y \
+    build-essential cmake python3 python3-pip git clang \
+    libssl-dev libsystemd-dev apache2 php libapache2-mod-php \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- Build SymCrypt ---
+WORKDIR /symcrypt
+RUN git clone https://github.com/microsoft/SymCrypt.git . \
+    && git submodule update --init \
+    && pip3 install -r scripts/requirements.txt \
+    && python3 scripts/build.py cmake build --config Release
+
+# Install SymCrypt libraries and headers
+RUN cp bin/module/AMD64/LinuxUserMode/libsymcrypt.so /usr/lib/ \
+    && cp inc/* /usr/include/
+
+# --- Build SymCrypt-OpenSSL ---
+WORKDIR /symcrypt-openssl
+RUN git clone https://github.com/microsoft/SymCrypt-OpenSSL.git . \
+    && mkdir bin && cd bin \
+    && cmake .. \
+       -DCMAKE_TOOLCHAIN_FILE=../cmake-toolchain/LinuxUserMode-AMD64.cmake \
+       -DSYMCRYPT_ROOT_DIR=/symcrypt \
+       -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build . --parallel
+
+# --- Set up Apache2 and a simple PHP web app ---
+WORKDIR /var/www/html
+RUN echo "<?php \
+if(isset(\$_POST['data'])) { \
+    \$data = \$_POST['data']; \
+    \$encrypted = openssl_encrypt(\$data, 'aes-256-cbc', 'testkey1234567890', 0, '1234567890123456'); \
+    echo 'Encrypted: ' . \$encrypted; \
+} else { \
+    echo '<form method=\"POST\"> \
+          <input name=\"data\" placeholder=\"Enter text\"> \
+          <button type=\"submit\">Encrypt</button> \
+          </form>'; \
+}" > index.php
+
+EXPOSE 80
+CMD ["apachectl", "-D", "FOREGROUND"]
