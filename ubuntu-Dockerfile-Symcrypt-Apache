@@ -1,9 +1,7 @@
-FROM ubuntu:22.04
-
-# Install dependencies for SymCrypt and OpenSSL
-RUN apt-get update && apt-get install -y \
+FROM ubuntu:22.04FROM ubuntu:22 && apt-get install -y \
     build-essential cmake python3 python3-pip git clang \
     libssl-dev libsystemd-dev apache2 php libapache2-mod-php \
+    openssl \
     && rm -rf /var/lib/apt/lists/*
 
 # --- Build SymCrypt ---
@@ -27,7 +25,7 @@ RUN git clone https://github.com/microsoft/SymCrypt-OpenSSL.git . \
        -DCMAKE_BUILD_TYPE=Release \
     && cmake --build . --parallel
 
-# --- Set up Apache2 and a simple PHP web app ---
+# --- Set up Apache2 and PHP web app ---
 WORKDIR /var/www/html
 RUN echo "<?php \
 if(isset(\$_POST['data'])) { \
@@ -41,5 +39,23 @@ if(isset(\$_POST['data'])) { \
           </form>'; \
 }" > index.php
 
-EXPOSE 80
+# --- Enable SSL and create self-signed certificate ---
+RUN a2enmod ssl \
+    && mkdir /etc/apache2/ssl \
+    && openssl req -x509 -nodes -days 365 \
+       -subj "/C=US/ST=State/L=City/O=Company/CN=localhost" \
+       -newkey rsa:2048 \
+       -keyout /etc/apache2/ssl/apache.key \
+       -out /etc/apache2/ssl/apache.crt \
+    && echo "<VirtualHost *:443> \
+        DocumentRoot /var/www/html \
+        SSLEngine on \
+        SSLCertificateFile /etc/apache2/ssl/apache.crt \
+        SSLCertificateKeyFile /etc/apache2/ssl/apache.key \
+    </VirtualHost>" > /etc/apache2/sites-available/default-ssl.conf \
+    && a2ensite default-ssl
+
+EXPOSE 80 443
 CMD ["apachectl", "-D", "FOREGROUND"]
+
+# Install dependencies for SymCrypt, OpenSSL, Apache2, and SSL
