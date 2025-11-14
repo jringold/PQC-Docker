@@ -1,0 +1,104 @@
+FROM ubuntu:22.04
+
+# Install Apache, PHP, and OpenSSL with OQS provider
+RUN apt-get update && apt-get install -y \
+    python3 python3-pip apache2 php libapache2-mod-php openssl \
+    libssl-dev libsystemd-dev git cmake build-essential curl clang \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir /symcrypt-openssl \
+    && mkdir /syncrypt \
+    && mkdir /oqs-provider \
+    && mkdir /var/www/html
+
+# -------------------------------
+# Build SymCrypt
+# -------------------------------
+WORKDIR /symcrypt
+RUN git clone https://github.com/microsoft/SymCrypt.git . \
+    && git submodule update --init \
+    && pip3 install -r scripts/requirements.txt \
+    && python3 scripts/build.py cmake build --config Release
+
+# -------------------------------
+# Build SymCrypt-OpenSSL
+# -------------------------------
+WORKDIR /symcrypt-openssl
+RUN git clone https://github.com/microsoft/SymCrypt-OpenSSL.git . \
+    && mkdir bin && cd bin \
+    && cmake .. \
+       -DCMAKE_TOOLCHAIN_FILE=../cmake-toolchain/LinuxUserMode-AMD64.cmake \
+       -DSYMCRYPT_ROOT_DIR=/symcrypt \
+       -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build . --parallel
+
+# -------------------------------
+# Stage 2: Runtime with Apache + ML-KEM SSL + Test Scripts
+# -------------------------------
+
+# Install OQS provider for PQC algorithms
+WORKDIR /oqs-provider
+RUN git clone https://github.com/open-quantum-safe/oqs-provider.git . \
+    && cmake . && make && make install
+
+# Copy SymCrypt and SymCrypt-OpenSSL artifacts from builder
+COPY --from=builder /symcrypt/bin/module/AMD64/LinuxUserMode/libsymcrypt.so /usr/lib/
+COPY --from=builder /symcrypt/inc /usr/include/
+COPY --from=builder /symcrypt-openssl/bin /usr/local/symcrypt-openssl/
+
+# Configure Apache web app
+WORKDIR /var/www/html
+RUN echo "<?php \
+if(isset(\$_POST['data'])) { \
+    \$data = \$_POST['data']; \
+    \$encrypted = openssl_encrypt(\$data, 'aes-256-cbc', 'testkey1234567890', 0, '1234567890123456'); \
+    echo 'Encrypted: ' . \$encrypted; \
+} else { \
+    echo '<form method=\"POST\"> \
+          <input name=\"data\" placeholder=\"Enter text\"> \
+          <button type=\"submit\">Encrypt</button> \
+          </form>'; \
+}" > index.php
+
+# Enable SSL and generate ML-KEM + ML-DSA certs
+RUN a2enmod ssl \
+    && mkdir /etc/apache2/ssl \
+    && openssl genpkey -algorithm ML-KEM-1024 -provider oqs -out /etc/apache2/ssl/mlkem-key.pem \
+    && openssl pkey -in /etc/apache2/ssl/mlkem-key.pem -pubout -out /etc/apache2/ssl/mlkem-pub.pem \
+    && openssl genpkey -algorithm ML-DSA-87 -provider oqs -out /etc/apache2/ssl/mldsa-key.pem \
+    && openssl x509 -new -key /etc/apache2/ssl/mldsa-key.pem \
+       -force_pubkey /etc/apache2/ssl/mlkem-pub.pem \
+       -out /etc/apache2/ssl/mlkem-cert.pem \
+       -subj "/CN=PQ_KEM_Server" -days 365 \
+       -extfile <(printf "keyUsage=keyEncipherment\n") \
+    && echo "<VirtualHost *:443> \
+        DocumentRoot /var/www/html \
+        SSLEngine on \
+        SSLCertificateFile /etc/apache2/ssl/mlkem-cert.pem \
+        SSLCertificateKeyFile /etc/apache2/ssl/mldsa-key.pem \
+    </VirtualHost>" > /etc/apache2/sites-available/default-ssl.conf \
+    && a2ensite default-ssl
+
+# Add test scripts inside container
+WORKDIR /usr/local/bin
+RUN echo '#!/bin/bash\n\
+DATA="HelloPostQuantumWorld"\n\
+URL="https://localhost:8443"\n\
+echo "Testing encryption with data: $DATA"\n\
+RESPONSE=$(curl --insecure -s -X POST -d "data=$DATA" $URL)\n\
+echo "Server Response:"\n\
+echo "$RESPONSE"\n' > test-encryption.sh \
+    && chmod +x test-encryption.sh
+
+RUN echo '#!/bin/bash\n\
+SERVER="localhost"\n\
+PORT="8443"\n\
+echo "=== Checking certificate details ==="\n\
+openssl s_client -connect $SERVER:$PORT -provider oqs -provider default -cipher ALL \\\n\
+    -verify_return_error </dev/null 2>/dev/null | openssl x509 -text -noout\n\
+echo "=== Testing TLS handshake with PQC support ==="\n\
+openssl s_client -connect $SERVER:$PORT -provider oqs -provider default \\\n\
+    -cipher ALL -curves ML-KEM-1024 </dev/null\n' > openssl-test.sh \
+    && chmod +x openssl-test.sh
+
+EXPOSE 80 443
+CMD ["apachectl", "-D", "FOREGROUND"]
